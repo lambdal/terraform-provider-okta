@@ -56,7 +56,7 @@ jobs:
         uses: goreleaser/goreleaser-action@v6
         with:
           version: "~> v2"
-          args: release --clean --skip=publish --single-target
+          args: release --clean --skip=publish --parallelism=2
         env:
           GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
 
