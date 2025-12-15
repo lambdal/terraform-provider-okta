@@ -89,7 +89,9 @@ jobs:
         run: |
           # TFE expects the short key-id (last 16 characters of fingerprint)
           FULL_FP="${{ steps.import_gpg.outputs.fingerprint }}"
-          SHORT_ID="${FULL_FP: -16}"
+          SHORT_ID=$(echo "$FULL_FP" | tail -c 17 | head -c 16)
+          echo "Full fingerprint: $FULL_FP"
+          echo "Short key-id: $SHORT_ID"
           echo "key_id=$SHORT_ID" >> $GITHUB_OUTPUT
 
       - name: Upload to TFE
