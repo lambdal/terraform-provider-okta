@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	urlpkg "net/url"
 	"reflect"
@@ -756,13 +757,15 @@ func (re *RequestExecutor) doWithRetries(ctx context.Context, req *http.Request)
 		maxRetries: re.config.Okta.Client.RateLimit.MaxRetries,
 	}
 	operation := func() error {
+		log.Printf("[DEBUG] *** CUSTOM PROVIDER: doWithRetries retryCount=%d authMode=%s ***", bOff.retryCount, re.config.Okta.Client.AuthorizationMode)
+
 		// Always rewind the request body when non-nil.
 		if bodyReader != nil {
 			req.Body = bodyReader()
 		}
 
 		// Re-authorize the request to create a new DPoP JWT and access token
-		if bOff.retryCount > 0 && re.config.Okta.Client.AuthorizationMode == "PrivateKey" || re.config.Okta.Client.AuthorizationMode == "JWT" {
+		if bOff.retryCount > 0 && (re.config.Okta.Client.AuthorizationMode == "PrivateKey" || re.config.Okta.Client.AuthorizationMode == "JWT") {
 			// Clear the token cache to force fresh authorization
 			// This will get a new access token and potentially a new nonce
 			re.tokenCache.Delete(AccessTokenCacheKey)
