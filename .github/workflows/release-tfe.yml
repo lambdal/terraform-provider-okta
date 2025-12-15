@@ -84,10 +84,18 @@ jobs:
           VERSION="${VERSION#v}"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
+      - name: Get short GPG key-id
+        id: gpg_short
+        run: |
+          # TFE expects the short key-id (last 16 characters of fingerprint)
+          FULL_FP="${{ steps.import_gpg.outputs.fingerprint }}"
+          SHORT_ID="${FULL_FP: -16}"
+          echo "key_id=$SHORT_ID" >> $GITHUB_OUTPUT
+
       - name: Upload to TFE
         env:
           TFE_TOKEN: ${{ secrets.TFE_TOKEN }}
-          GPG_KEY_ID: ${{ steps.import_gpg.outputs.fingerprint }}
+          GPG_KEY_ID: ${{ steps.gpg_short.outputs.key_id }}
         run: |
           python3 scripts/upload_to_tfe.py --version "${{ steps.version.outputs.version }}"
 
