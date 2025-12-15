@@ -37,6 +37,11 @@ def main():
         print("ERROR: GPG_KEY_ID environment variable is required")
         sys.exit(1)
 
+    # TFE expects the short key-id (last 16 characters of fingerprint)
+    if len(gpg_key_id) > 16:
+        gpg_key_id = gpg_key_id[-16:]
+        print(f"    Using short key-id: {gpg_key_id}")
+
     host = os.environ.get('TFE_HOST', 'terraform.lambdalabs.cloud')
     org = os.environ.get('TFE_ORG', 'lambdacloud')
     provider = os.environ.get('PROVIDER_NAME', 'okta')
