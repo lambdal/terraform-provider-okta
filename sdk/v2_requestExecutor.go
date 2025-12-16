@@ -818,22 +818,30 @@ func (re *RequestExecutor) doWithRetries(ctx context.Context, req *http.Request)
 		}
 
 		// Check for DPoP-related 400 errors that should trigger a retry with fresh auth
-		if resp.StatusCode == http.StatusBadRequest && (re.config.Okta.Client.AuthorizationMode == "PrivateKey" || re.config.Okta.Client.AuthorizationMode == "JWT") {
+		if resp.StatusCode == http.StatusBadRequest {
 			// Read response body to check for DPoP errors
 			bodyBytes, readErr := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			if readErr == nil {
 				bodyStr := string(bodyBytes)
-				// Check for DPoP-related error messages
-				if strings.Contains(bodyStr, "invalid_dpop_proof") ||
-					strings.Contains(bodyStr, "use_dpop_nonce") ||
-					strings.Contains(bodyStr, "DPoP") ||
-					strings.Contains(bodyStr, "dpop") {
-					log.Printf("[DEBUG] *** CUSTOM PROVIDER: DPoP error detected, will retry: %s ***", bodyStr)
-					// Restore body for potential error handling by caller
-					resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-					// Return retriable error to trigger retry with fresh DPoP JWT
-					return fmt.Errorf("DPoP authentication error: %s", bodyStr)
+				log.Printf("[DEBUG] *** CUSTOM PROVIDER: Got 400 error, body: %s ***", bodyStr)
+				log.Printf("[DEBUG] *** CUSTOM PROVIDER: AuthMode=%s, retryCount=%d ***", re.config.Okta.Client.AuthorizationMode, bOff.retryCount)
+
+				// For PrivateKey/JWT auth, check for DPoP-related error messages and retry
+				if re.config.Okta.Client.AuthorizationMode == "PrivateKey" || re.config.Okta.Client.AuthorizationMode == "JWT" {
+					// Check for DPoP-related error messages
+					if strings.Contains(bodyStr, "invalid_dpop_proof") ||
+						strings.Contains(bodyStr, "use_dpop_nonce") ||
+						strings.Contains(bodyStr, "DPoP") ||
+						strings.Contains(bodyStr, "dpop") ||
+						strings.Contains(bodyStr, "nonce") ||
+						strings.Contains(bodyStr, "proof") {
+						log.Printf("[DEBUG] *** CUSTOM PROVIDER: DPoP error detected, will retry ***")
+						// Restore body for potential error handling by caller
+						resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+						// Return retriable error to trigger retry with fresh DPoP JWT
+						return fmt.Errorf("DPoP authentication error: %s", bodyStr)
+					}
 				}
 				// Restore body for other 400 errors
 				resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
