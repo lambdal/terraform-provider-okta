@@ -772,8 +772,10 @@ func (re *RequestExecutor) doWithRetries(ctx context.Context, req *http.Request)
 			req.Body = bodyReader()
 		}
 
-		// Re-authorize the request to create a new DPoP JWT and access token
-		if bOff.retryCount > 0 && (re.config.Okta.Client.AuthorizationMode == "PrivateKey" || re.config.Okta.Client.AuthorizationMode == "JWT") {
+		// ALWAYS re-authorize for PrivateKey/JWT to get fresh DPoP JWT
+		// This reverts PR #2585 optimization - clearing cache on every request
+		// is needed to avoid 400 errors with empty body
+		if re.config.Okta.Client.AuthorizationMode == "PrivateKey" || re.config.Okta.Client.AuthorizationMode == "JWT" {
 			// Clear the token cache to force fresh authorization
 			// This will get a new access token and potentially a new nonce
 			re.tokenCache.Delete(AccessTokenCacheKey)
