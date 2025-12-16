@@ -816,6 +816,30 @@ func (re *RequestExecutor) doWithRetries(ctx context.Context, req *http.Request)
 			// this is error is considered to be permanent and should not be retried
 			return backoff.Permanent(err)
 		}
+
+		// Check for DPoP-related 400 errors that should trigger a retry with fresh auth
+		if resp.StatusCode == http.StatusBadRequest && (re.config.Okta.Client.AuthorizationMode == "PrivateKey" || re.config.Okta.Client.AuthorizationMode == "JWT") {
+			// Read response body to check for DPoP errors
+			bodyBytes, readErr := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if readErr == nil {
+				bodyStr := string(bodyBytes)
+				// Check for DPoP-related error messages
+				if strings.Contains(bodyStr, "invalid_dpop_proof") ||
+					strings.Contains(bodyStr, "use_dpop_nonce") ||
+					strings.Contains(bodyStr, "DPoP") ||
+					strings.Contains(bodyStr, "dpop") {
+					log.Printf("[DEBUG] *** CUSTOM PROVIDER: DPoP error detected, will retry: %s ***", bodyStr)
+					// Restore body for potential error handling by caller
+					resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+					// Return retriable error to trigger retry with fresh DPoP JWT
+					return fmt.Errorf("DPoP authentication error: %s", bodyStr)
+				}
+				// Restore body for other 400 errors
+				resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			}
+		}
+
 		if !tooManyRequests(resp) {
 			return nil
 		}
