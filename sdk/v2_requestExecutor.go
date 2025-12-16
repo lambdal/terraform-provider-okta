@@ -756,7 +756,15 @@ func (re *RequestExecutor) doWithRetries(ctx context.Context, req *http.Request)
 		ctx:        ctx,
 		maxRetries: re.config.Okta.Client.RateLimit.MaxRetries,
 	}
+	firstAttempt := true
 	operation := func() error {
+		// Increment retry count on any retry, not just 429s
+		// This ensures DPoP JWT is regenerated for EOF/network retries too
+		if !firstAttempt {
+			bOff.retryCount++
+		}
+		firstAttempt = false
+
 		log.Printf("[DEBUG] *** CUSTOM PROVIDER: doWithRetries retryCount=%d authMode=%s ***", bOff.retryCount, re.config.Okta.Client.AuthorizationMode)
 
 		// Always rewind the request body when non-nil.
@@ -822,9 +830,9 @@ func (re *RequestExecutor) doWithRetries(ctx context.Context, req *http.Request)
 			backoffDuration = re.config.Okta.Client.RateLimit.MaxBackoff
 		}
 		bOff.backoffDuration = time.Second * time.Duration(backoffDuration)
-		bOff.retryCount++
+		// Note: retryCount is now incremented at the start of the operation for all retry types
 		req.Header.Add("X-Okta-Retry-For", resp.Header.Get("X-Okta-Request-Id"))
-		req.Header.Add("X-Okta-Retry-Count", fmt.Sprint(bOff.retryCount))
+		req.Header.Add("X-Okta-Retry-Count", fmt.Sprint(bOff.retryCount+1))
 		return errors.New("too many requests")
 	}
 	err = backoff.Retry(operation, bOff)
