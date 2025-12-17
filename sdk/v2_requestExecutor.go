@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	urlpkg "net/url"
 	"reflect"
@@ -507,6 +508,7 @@ func generateDpopJWT(privateKey *rsa.PrivateKey, httpMethod, URL, nonce, accessT
 		parsedURL.Fragment = ""
 		htuURL = parsedURL.String()
 	}
+	log.Printf("[DEBUG] generateDpopJWT: URL=%s, htuURL=%s, method=%s", URL, htuURL, httpMethod)
 
 	dpopClaims := DpopClaims{
 		ID:         uuid.New().String(),
@@ -774,6 +776,8 @@ func (re *RequestExecutor) doWithRetries(ctx context.Context, req *http.Request)
 		}
 		firstAttempt = false
 
+		log.Printf("[DEBUG] doWithRetries: retryCount=%d, URL=%s", bOff.retryCount, req.URL.String())
+
 		// Always rewind the request body when non-nil.
 		if bodyReader != nil {
 			req.Body = bodyReader()
@@ -824,6 +828,12 @@ func (re *RequestExecutor) doWithRetries(ctx context.Context, req *http.Request)
 			return backoff.Permanent(err)
 		}
 
+		if resp.StatusCode == http.StatusBadRequest {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			log.Printf("[DEBUG] Got 400 error: URL=%s, body=%s", req.URL.String(), string(bodyBytes))
+			resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		}
 		if !tooManyRequests(resp) {
 			return nil
 		}
