@@ -499,10 +499,20 @@ func generateDpopJWT(privateKey *rsa.PrivateKey, httpMethod, URL, nonce, accessT
 	if err != nil {
 		return "", err
 	}
+
+	// Per RFC 9449, the htu claim must not include query or fragment parts
+	// Strip query parameters from URL for the htu claim
+	htuURL := URL
+	if parsedURL, err := urlpkg.Parse(URL); err == nil {
+		parsedURL.RawQuery = ""
+		parsedURL.Fragment = ""
+		htuURL = parsedURL.String()
+	}
+
 	dpopClaims := DpopClaims{
 		ID:         uuid.New().String(),
 		HTTPMethod: httpMethod,
-		HTTPURI:    URL,
+		HTTPURI:    htuURL,
 		IssuedAt:   jwt.NewNumericDate(time.Now()),
 		Nonce:      nonce,
 	}
@@ -765,19 +775,15 @@ func (re *RequestExecutor) doWithRetries(ctx context.Context, req *http.Request)
 		}
 		firstAttempt = false
 
-		log.Printf("[DEBUG] *** CUSTOM PROVIDER: doWithRetries retryCount=%d authMode=%s ***", bOff.retryCount, re.config.Okta.Client.AuthorizationMode)
-
 		// Always rewind the request body when non-nil.
 		if bodyReader != nil {
 			req.Body = bodyReader()
 		}
 
-		// ALWAYS re-authorize for PrivateKey/JWT to get fresh DPoP JWT
-		// This reverts PR #2585 optimization - clearing cache on every request
-		// is needed to avoid 400 errors with empty body
-		if re.config.Okta.Client.AuthorizationMode == "PrivateKey" || re.config.Okta.Client.AuthorizationMode == "JWT" {
-			// Clear the token cache to force fresh authorization
-			// This will get a new access token and potentially a new nonce
+		// Re-authorize the request to create a new DPoP JWT and access token on retries
+		// This handles 429 rate limits, EOF errors, and other retriable failures
+		if bOff.retryCount > 0 && (re.config.Okta.Client.AuthorizationMode == "PrivateKey" || re.config.Okta.Client.AuthorizationMode == "JWT") {
+			// Clear the token cache to force fresh authorization on retry
 			re.tokenCache.Delete(AccessTokenCacheKey)
 			re.tokenCache.Delete(DpopAccessTokenNonce)
 			re.tokenCache.Delete(DpopAccessTokenPrivateKey)
@@ -817,34 +823,6 @@ func (re *RequestExecutor) doWithRetries(ctx context.Context, req *http.Request)
 		} else if err != nil {
 			// this is error is considered to be permanent and should not be retried
 			return backoff.Permanent(err)
-		}
-
-		// Check for 400 errors that might be DPoP-related and should trigger a retry with fresh auth
-		// For PrivateKey/JWT auth modes, retry all 400 errors once since the body may be empty
-		if resp.StatusCode == http.StatusBadRequest && (re.config.Okta.Client.AuthorizationMode == "PrivateKey" || re.config.Okta.Client.AuthorizationMode == "JWT") {
-			// Read response body for logging
-			bodyBytes, readErr := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			bodyStr := ""
-			if readErr == nil {
-				bodyStr = string(bodyBytes)
-			}
-			log.Printf("[DEBUG] *** CUSTOM PROVIDER: Got 400 error with PrivateKey/JWT auth, body: %s, retryCount: %d ***", bodyStr, bOff.retryCount)
-
-			// Only retry once to avoid infinite loops - if retryCount is already > 0, we've already retried
-			if bOff.retryCount == 0 {
-				log.Printf("[DEBUG] *** CUSTOM PROVIDER: Will retry 400 error with fresh DPoP credentials ***")
-				// Restore body for potential error handling by caller
-				if len(bodyBytes) > 0 {
-					resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-				}
-				// Return retriable error to trigger retry with fresh DPoP JWT
-				return fmt.Errorf("400 error with DPoP auth, retrying with fresh credentials")
-			}
-			// Already retried once, restore body and let it fail
-			if len(bodyBytes) > 0 {
-				resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-			}
 		}
 
 		if !tooManyRequests(resp) {

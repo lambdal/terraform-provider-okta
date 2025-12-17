@@ -126,7 +126,6 @@ func Provider() *schema.Provider {
 // providerConfigure is only called once when a terraform command is run but it
 // will be called many times while running different ACC tests
 func providerConfigure(ctx context.Context, d *schema.ResourceData) (interface{}, diag.Diagnostics) {
-	log.Printf("[INFO] *** USING CUSTOM LOCAL OKTA PROVIDER BUILD ***")
 	log.Printf("[INFO] Initializing Okta client")
 	cfg := config.NewConfig(d)
 	if err := cfg.LoadAPIClient(); err != nil {
