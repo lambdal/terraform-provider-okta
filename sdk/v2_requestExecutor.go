@@ -768,6 +768,7 @@ func (re *RequestExecutor) doWithRetries(ctx context.Context, req *http.Request)
 		maxRetries: re.config.Okta.Client.RateLimit.MaxRetries,
 	}
 	firstAttempt := true
+	nonceRetry := false // Track if this is a nonce-only retry (don't need full re-auth)
 	operation := func() error {
 		// Increment retry count on any retry, not just 429s
 		// This ensures DPoP JWT is regenerated for EOF/network retries too
@@ -776,7 +777,7 @@ func (re *RequestExecutor) doWithRetries(ctx context.Context, req *http.Request)
 		}
 		firstAttempt = false
 
-		log.Printf("[DEBUG] doWithRetries: retryCount=%d, URL=%s", bOff.retryCount, req.URL.String())
+		log.Printf("[DEBUG] doWithRetries: retryCount=%d, nonceRetry=%v, URL=%s", bOff.retryCount, nonceRetry, req.URL.String())
 
 		// Always rewind the request body when non-nil.
 		if bodyReader != nil {
@@ -784,8 +785,9 @@ func (re *RequestExecutor) doWithRetries(ctx context.Context, req *http.Request)
 		}
 
 		// Re-authorize the request to create a new DPoP JWT and access token on retries
+		// Skip full re-auth for nonce-only retries since we already updated the DPoP header
 		// This handles 429 rate limits, EOF errors, and other retriable failures
-		if bOff.retryCount > 0 && (re.config.Okta.Client.AuthorizationMode == "PrivateKey" || re.config.Okta.Client.AuthorizationMode == "JWT") {
+		if bOff.retryCount > 0 && !nonceRetry && (re.config.Okta.Client.AuthorizationMode == "PrivateKey" || re.config.Okta.Client.AuthorizationMode == "JWT") {
 			// Clear the token cache to force fresh authorization on retry
 			re.tokenCache.Delete(AccessTokenCacheKey)
 			re.tokenCache.Delete(DpopAccessTokenNonce)
@@ -819,6 +821,8 @@ func (re *RequestExecutor) doWithRetries(ctx context.Context, req *http.Request)
 				req.Body = bodyReader()
 			}
 		}
+		// Reset nonce retry flag after we've used it - next iteration should do full re-auth if needed
+		nonceRetry = false
 		resp, err = re.httpClient.Do(req.WithContext(ctx))
 		if errors.Is(err, io.EOF) {
 			// retry on EOF errors, which might be caused by network connectivity issues
@@ -833,6 +837,39 @@ func (re *RequestExecutor) doWithRetries(ctx context.Context, req *http.Request)
 			resp.Body.Close()
 			log.Printf("[DEBUG] Got 400 error: URL=%s, body=%s", req.URL.String(), string(bodyBytes))
 			resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+			// Handle DPoP nonce requirement from Okta
+			// When the server requires a nonce, it returns use_dpop_nonce error with Dpop-Nonce header
+			if strings.Contains(string(bodyBytes), "use_dpop_nonce") {
+				newNonce := resp.Header.Get("Dpop-Nonce")
+				if newNonce != "" && (re.config.Okta.Client.AuthorizationMode == "PrivateKey" || re.config.Okta.Client.AuthorizationMode == "JWT") {
+					log.Printf("[DEBUG] Received use_dpop_nonce error, retrying with nonce: %s", newNonce)
+					// Get the cached private key to regenerate DPoP JWT with new nonce
+					privateKey, ok := re.tokenCache.Get(DpopAccessTokenPrivateKey)
+					if ok && privateKey != nil {
+						// Get the access token for the ath claim
+						accessTokenWithType, _ := re.tokenCache.Get(AccessTokenCacheKey)
+						var accessToken string
+						if accessTokenWithType != nil {
+							parts := strings.Split(accessTokenWithType.(string), " ")
+							if len(parts) == 2 {
+								accessToken = parts[1]
+							}
+						}
+						// Regenerate DPoP JWT with the server-provided nonce
+						dpopJWT, err := generateDpopJWT(privateKey.(*rsa.PrivateKey), req.Method, req.URL.String(), newNonce, accessToken)
+						if err == nil {
+							req.Header.Set("Dpop", dpopJWT)
+							// Update cached nonce for future requests
+							re.tokenCache.Set(DpopAccessTokenNonce, newNonce, goCache.DefaultExpiration)
+							// Mark as nonce-only retry to skip full re-auth
+							nonceRetry = true
+							// Signal retry
+							return errors.New("dpop nonce required, retrying")
+						}
+					}
+				}
+			}
 		}
 		if !tooManyRequests(resp) {
 			return nil
