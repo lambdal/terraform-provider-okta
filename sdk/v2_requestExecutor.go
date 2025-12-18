@@ -844,6 +844,7 @@ func (re *RequestExecutor) doWithRetries(ctx context.Context, req *http.Request)
 	}
 	firstAttempt := true
 	nonceRetry := false // Track if this is a nonce-only retry (don't need full re-auth)
+	currentNonce := ""  // Track the current nonce for DPoP JWT generation
 	operation := func() error {
 		// Increment retry count on any retry, not just 429s
 		// This ensures DPoP JWT is regenerated for EOF/network retries too
@@ -889,8 +890,38 @@ func (re *RequestExecutor) doWithRetries(ctx context.Context, req *http.Request)
 			if bodyReader != nil {
 				req.Body = bodyReader()
 			}
+		} else if !nonceRetry && (re.config.Okta.Client.AuthorizationMode == "PrivateKey" || re.config.Okta.Client.AuthorizationMode == "JWT") {
+			// For first attempt (retryCount == 0) or after nonce retry reset,
+			// regenerate DPoP JWT to ensure unique jti for each request attempt
+			// This prevents "DPoP proof JWT has already been used" errors
+			privateKey, ok := re.tokenCache.Get(DpopAccessTokenPrivateKey)
+			if ok && privateKey != nil {
+				accessTokenWithType, _ := re.tokenCache.Get(AccessTokenCacheKey)
+				if accessTokenWithType != nil {
+					parts := strings.Split(accessTokenWithType.(string), " ")
+					if len(parts) == 2 && parts[0] == "DPoP" {
+						// Get nonce from cache or use the one from previous nonce retry
+						nonce := currentNonce
+						if nonce == "" {
+							if cachedNonce, hasNonce := re.tokenCache.Get(DpopAccessTokenNonce); hasNonce && cachedNonce != nil {
+								nonce = cachedNonce.(string)
+							}
+						}
+						// Generate fresh DPoP JWT with unique jti
+						dpopJWT, err := generateDpopJWT(privateKey.(*rsa.PrivateKey), req.Method, req.URL.String(), nonce, parts[1])
+						if err == nil {
+							req.Header.Set("Dpop", dpopJWT)
+							log.Printf("[DEBUG] Regenerated DPoP JWT for request: URL=%s", req.URL.String())
+						}
+					}
+				}
+			}
+			req.Header = req.Header.Clone()
+			if bodyReader != nil {
+				req.Body = bodyReader()
+			}
 		} else {
-			// Reuse the existing request headers and body
+			// Nonce retry - headers already updated with new DPoP JWT
 			req.Header = req.Header.Clone()
 			if bodyReader != nil {
 				req.Body = bodyReader()
@@ -898,6 +929,7 @@ func (re *RequestExecutor) doWithRetries(ctx context.Context, req *http.Request)
 		}
 		// Reset nonce retry flag after we've used it - next iteration should do full re-auth if needed
 		nonceRetry = false
+		currentNonce = ""
 		resp, err = re.httpClient.Do(req.WithContext(ctx))
 		if errors.Is(err, io.EOF) {
 			// retry on EOF errors, which might be caused by network connectivity issues
@@ -937,6 +969,8 @@ func (re *RequestExecutor) doWithRetries(ctx context.Context, req *http.Request)
 							req.Header.Set("Dpop", dpopJWT)
 							// Update cached nonce for future requests
 							re.tokenCache.Set(DpopAccessTokenNonce, newNonce, goCache.DefaultExpiration)
+							// Track nonce for this retry cycle
+							currentNonce = newNonce
 							// Mark as nonce-only retry to skip full re-auth
 							nonceRetry = true
 							// Signal retry
