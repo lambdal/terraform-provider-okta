@@ -1,0 +1,122 @@
+# Publish provider to Lambda Labs Terraform Enterprise private registry
+#
+# This workflow builds and uploads the provider to terraform.lambdalabs.cloud
+# when a tag matching "v*" is pushed.
+#
+# Required secrets:
+#   GPG_PRIVATE_KEY_TFE  - GPG private key (no passphrase) for signing
+#   TFE_TOKEN            - TFE API token with registry management permissions
+#
+name: Release to TFE
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Allow manual trigger for re-publishing
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Git tag to publish (e.g., v1.0.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  TFE_HOST: terraform.lambdalabs.cloud
+  TFE_ORG: lambdacloud
+  PROVIDER_NAME: okta
+
+jobs:
+  release-tfe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: "go.mod"
+          cache: true
+
+      - name: Import GPG key
+        id: import_gpg
+        uses: crazy-max/ghaction-import-gpg@v6
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY_TFE }}
+          # No passphrase for CI/CD key
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean --skip=publish --parallelism=2
+        env:
+          GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
+
+      - name: Export GPG public key
+        run: |
+          gpg --armor --export ${{ steps.import_gpg.outputs.fingerprint }} > dist/gpg-public-key.asc
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Extract version
+        id: version
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            VERSION="${{ inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          # Remove 'v' prefix if present
+          VERSION="${VERSION#v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Get short GPG key-id
+        id: gpg_short
+        run: |
+          # TFE expects the short key-id (last 16 characters of fingerprint)
+          FULL_FP="${{ steps.import_gpg.outputs.fingerprint }}"
+          SHORT_ID=$(echo "$FULL_FP" | tail -c 17 | head -c 16)
+          echo "Full fingerprint: $FULL_FP"
+          echo "Short key-id: $SHORT_ID"
+          echo "key_id=$SHORT_ID" >> $GITHUB_OUTPUT
+
+      - name: Upload to TFE
+        env:
+          TFE_TOKEN: ${{ secrets.TFE_TOKEN }}
+          GPG_KEY_ID: ${{ steps.gpg_short.outputs.key_id }}
+        run: |
+          python3 scripts/upload_to_tfe.py --version "${{ steps.version.outputs.version }}"
+
+      - name: Summary
+        run: |
+          echo "## Provider Published to TFE" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Registry URL:** https://${{ env.TFE_HOST }}/app/${{ env.TFE_ORG }}/registry/providers/private/${{ env.TFE_ORG }}/${{ env.PROVIDER_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Usage" >> $GITHUB_STEP_SUMMARY
+          echo '```hcl' >> $GITHUB_STEP_SUMMARY
+          echo 'terraform {' >> $GITHUB_STEP_SUMMARY
+          echo '  required_providers {' >> $GITHUB_STEP_SUMMARY
+          echo '    okta = {' >> $GITHUB_STEP_SUMMARY
+          echo '      source  = "${{ env.TFE_HOST }}/${{ env.TFE_ORG }}/okta"' >> $GITHUB_STEP_SUMMARY
+          echo '      version = "${{ steps.version.outputs.version }}"' >> $GITHUB_STEP_SUMMARY
+          echo '    }' >> $GITHUB_STEP_SUMMARY
+          echo '  }' >> $GITHUB_STEP_SUMMARY
+          echo '}' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY

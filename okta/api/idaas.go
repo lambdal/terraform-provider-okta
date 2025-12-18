@@ -103,14 +103,49 @@ func NewOktaIDaaSAPIClient(c *OktaAPIConfig) (client OktaIDaaSClient, err error)
 		return
 	}
 
-	httpClient := v3Client.GetConfig().HTTPClient
-	v2Client, err := oktaV2SDKClient(httpClient, c)
+	// For V2 SDK with DPoP (PrivateKey auth), use a non-retryable HTTP client.
+	// The retryablehttp library reuses the same request on retries, which causes
+	// "DPoP proof JWT has already been used" errors because the same JWT is sent twice.
+	// The V2 SDK has its own retry logic in doWithRetries() that properly regenerates
+	// DPoP JWTs on each retry attempt.
+	var v2HttpClient *http.Client
+	if c.PrivateKey != "" {
+		// Use a simple HTTP client without retryablehttp wrapper for DPoP auth
+		v2HttpClient = cleanhttp.DefaultClient()
+		logLevel := strings.ToLower(os.Getenv("TF_LOG"))
+		debugHttpRequests := (logLevel == "1" || logLevel == "debug" || logLevel == "trace")
+		if debugHttpRequests {
+			//lint:ignore SA1019 used in developer mode only
+			v2HttpClient.Transport = logging.NewTransport("Okta", v2HttpClient.Transport)
+		} else {
+			v2HttpClient.Transport = logging.NewSubsystemLoggingHTTPTransport("Okta", v2HttpClient.Transport)
+		}
+		// Add transport governor if configured
+		if c.MaxAPICapacity > 0 && c.MaxAPICapacity < 100 {
+			apiMutex, err := apimutex.NewAPIMutex(c.MaxAPICapacity)
+			if err != nil {
+				return nil, err
+			}
+			v2HttpClient.Transport = transport.NewGovernedTransport(v2HttpClient.Transport, apiMutex, c.Logger)
+		}
+		c.Logger.Info("v2 running with non-retryable http client for DPoP authentication (v2 SDK has its own retry logic)")
+	} else {
+		// Use the same HTTP client as V3 for non-DPoP auth
+		v2HttpClient = v3Client.GetConfig().HTTPClient
+	}
+
+	v2Client, err := oktaV2SDKClient(v2HttpClient, c)
 	if err != nil {
 		return
 	}
 
 	re := v2Client.CloneRequestExecutor()
-	re.SetHTTPTransport(v3Client.GetConfig().HTTPClient.Transport)
+	// For DPoP auth, use the non-retryable transport; otherwise use V3's transport
+	if c.PrivateKey != "" {
+		re.SetHTTPTransport(v2HttpClient.Transport)
+	} else {
+		re.SetHTTPTransport(v3Client.GetConfig().HTTPClient.Transport)
+	}
 	supClient := &sdk.APISupplement{
 		RequestExecutor: re,
 	}
