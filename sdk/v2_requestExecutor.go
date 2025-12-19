@@ -47,6 +47,62 @@ const (
 	DpopAccessTokenPrivateKey = "DPOP_OKTA_ACCESS_TOKEN_PRIVATE_KEY"
 )
 
+// applyTokenToRequest applies cached token and DPoP headers to the request.
+// Returns true if a cached token was found and applied, false otherwise.
+func applyTokenToRequest(req *http.Request, tokenCache *goCache.Cache, method, URL string) (bool, error) {
+	accessToken, hasToken := tokenCache.Get(AccessTokenCacheKey)
+	if !hasToken || accessToken == "" {
+		return false, nil
+	}
+
+	accessTokenWithTokenType := accessToken.(string)
+	req.Header.Add("Authorization", accessTokenWithTokenType)
+
+	nonce, hasNonce := tokenCache.Get(DpopAccessTokenNonce)
+	if hasNonce && nonce != "" {
+		privateKey, ok := tokenCache.Get(DpopAccessTokenPrivateKey)
+		if ok && privateKey != nil {
+			res := strings.Split(accessTokenWithTokenType, " ")
+			if len(res) != 2 {
+				return false, errors.New("unidentified access token")
+			}
+			dpopJWT, err := generateDpopJWT(privateKey.(*rsa.PrivateKey), method, URL, nonce.(string), res[1])
+			if err != nil {
+				return false, err
+			}
+			req.Header.Set("Dpop", dpopJWT)
+			req.Header.Set("x-okta-user-agent-extended", "isDPoP:true")
+		} else {
+			return false, errors.New("using Dpop but signing key not found")
+		}
+	}
+	return true, nil
+}
+
+// cacheNewToken stores the access token and DPoP-related values in the cache.
+func cacheNewToken(tokenCache *goCache.Cache, accessToken *RequestAccessToken, nonce string, privateKey *rsa.PrivateKey) {
+	// Trim a couple of seconds off calculated expiry so cache expiry
+	// occurs before Okta server side expiry.
+	expiration := accessToken.ExpiresIn - 2
+	tokenCache.Set(AccessTokenCacheKey, fmt.Sprintf("%v %v", accessToken.TokenType, accessToken.AccessToken), time.Second*time.Duration(expiration))
+	tokenCache.Set(DpopAccessTokenNonce, nonce, time.Second*time.Duration(expiration))
+	tokenCache.Set(DpopAccessTokenPrivateKey, privateKey, time.Second*time.Duration(expiration))
+}
+
+// setDpopHeaders sets the DPoP headers on the request for DPoP token types.
+func setDpopHeaders(req *http.Request, accessToken *RequestAccessToken, privateKey *rsa.PrivateKey, method, URL, nonce string) error {
+	req.Header.Set("Authorization", fmt.Sprintf("%v %v", accessToken.TokenType, accessToken.AccessToken))
+	if accessToken.TokenType == "DPoP" {
+		dpopJWT, err := generateDpopJWT(privateKey, method, URL, nonce, accessToken.AccessToken)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Dpop", dpopJWT)
+		req.Header.Set("x-okta-user-agent-extended", "isDPoP:true")
+	}
+	return nil
+}
+
 type RequestExecutor struct {
 	httpClient        *http.Client
 	config            *config
@@ -152,103 +208,58 @@ func NewPrivateKeyAuth(config PrivateKeyAuthConfig) *PrivateKeyAuth {
 }
 
 func (a *PrivateKeyAuth) Authorize(method, URL string) error {
-	accessToken, hasToken := a.tokenCache.Get(AccessTokenCacheKey)
-	if hasToken && accessToken != "" {
-		accessTokenWithTokenType := accessToken.(string)
-		a.req.Header.Add("Authorization", accessTokenWithTokenType)
-		nonce, hasNonce := a.tokenCache.Get(DpopAccessTokenNonce)
-		if hasNonce && nonce != "" {
-			privateKey, ok := a.tokenCache.Get(DpopAccessTokenPrivateKey)
-			if ok && privateKey != nil {
-				res := strings.Split(accessTokenWithTokenType, " ")
-				if len(res) != 2 {
-					return errors.New("unidentified access token")
-				}
-				dpopJWT, err := generateDpopJWT(privateKey.(*rsa.PrivateKey), method, URL, nonce.(string), res[1])
-				if err != nil {
-					return err
-				}
-				a.req.Header.Set("Dpop", dpopJWT)
-				a.req.Header.Set("x-okta-user-agent-extended", "isDPoP:true")
-			} else {
-				return errors.New("using Dpop but signing key not found")
-			}
-		}
-	} else {
-		// Use mutex to prevent concurrent token acquisition race conditions
-		// Only one goroutine should acquire a new token at a time
-		tokenAcquisitionMutex.Lock()
-
-		// Double-check if another goroutine already acquired the token while we waited
-		accessToken, hasToken = a.tokenCache.Get(AccessTokenCacheKey)
-		if hasToken && accessToken != "" {
-			tokenAcquisitionMutex.Unlock()
-			// Token was acquired by another goroutine, use it
-			accessTokenWithTokenType := accessToken.(string)
-			a.req.Header.Add("Authorization", accessTokenWithTokenType)
-			nonce, hasNonce := a.tokenCache.Get(DpopAccessTokenNonce)
-			if hasNonce && nonce != "" {
-				privateKey, ok := a.tokenCache.Get(DpopAccessTokenPrivateKey)
-				if ok && privateKey != nil {
-					res := strings.Split(accessTokenWithTokenType, " ")
-					if len(res) != 2 {
-						return errors.New("unidentified access token")
-					}
-					dpopJWT, err := generateDpopJWT(privateKey.(*rsa.PrivateKey), method, URL, nonce.(string), res[1])
-					if err != nil {
-						return err
-					}
-					a.req.Header.Set("Dpop", dpopJWT)
-					a.req.Header.Set("x-okta-user-agent-extended", "isDPoP:true")
-				} else {
-					return errors.New("using Dpop but signing key not found")
-				}
-			}
-			return nil
-		}
-
-		// We need to acquire a new token
-		defer tokenAcquisitionMutex.Unlock()
-
-		if a.privateKeySigner == nil {
-			var err error
-			a.privateKeySigner, err = CreateKeySigner(a.privateKey, a.privateKeyId)
-			if err != nil {
-				return err
-			}
-		}
-
-		clientAssertion, err := CreateClientAssertion(a.orgURL, a.clientId, a.privateKeySigner)
-		if err != nil {
-			return err
-		}
-
-		newAccessToken, nonce, privateKey, err := getAccessTokenForPrivateKey(a.httpClient, a.orgURL, clientAssertion, a.scopes, a.maxRetries, a.maxBackoff, a.clientId, a.privateKeySigner)
-		if err != nil {
-			return err
-		}
-
-		if newAccessToken == nil {
-			return errors.New("empty access token")
-		}
-
-		a.req.Header.Set("Authorization", fmt.Sprintf("%v %v", newAccessToken.TokenType, newAccessToken.AccessToken))
-		if newAccessToken.TokenType == "DPoP" {
-			dpopJWT, err := generateDpopJWT(privateKey, method, URL, nonce, newAccessToken.AccessToken)
-			if err != nil {
-				return err
-			}
-			a.req.Header.Set("Dpop", dpopJWT)
-			a.req.Header.Set("x-okta-user-agent-extended", "isDPoP:true")
-		}
-
-		// Trim a couple of seconds off calculated expiry so cache expiry
-		// occures before Okta server side expiry.
-		expiration := newAccessToken.ExpiresIn - 2
-		a.tokenCache.Set(AccessTokenCacheKey, fmt.Sprintf("%v %v", newAccessToken.TokenType, newAccessToken.AccessToken), time.Second*time.Duration(expiration))
-		a.tokenCache.Set(DpopAccessTokenNonce, nonce, time.Second*time.Duration(expiration))
-		a.tokenCache.Set(DpopAccessTokenPrivateKey, privateKey, time.Second*time.Duration(expiration))
+	// Try to use cached token first
+	applied, err := applyTokenToRequest(a.req, a.tokenCache, method, URL)
+	if err != nil {
+		return err
 	}
+	if applied {
+		return nil
+	}
+
+	// No cached token - need to acquire one with mutex protection
+	tokenAcquisitionMutex.Lock()
+
+	// Double-check if another goroutine already acquired the token while we waited
+	applied, err = applyTokenToRequest(a.req, a.tokenCache, method, URL)
+	if err != nil {
+		tokenAcquisitionMutex.Unlock()
+		return err
+	}
+	if applied {
+		tokenAcquisitionMutex.Unlock()
+		return nil
+	}
+
+	// We need to acquire a new token
+	defer tokenAcquisitionMutex.Unlock()
+
+	if a.privateKeySigner == nil {
+		a.privateKeySigner, err = CreateKeySigner(a.privateKey, a.privateKeyId)
+		if err != nil {
+			return err
+		}
+	}
+
+	clientAssertion, err := CreateClientAssertion(a.orgURL, a.clientId, a.privateKeySigner)
+	if err != nil {
+		return err
+	}
+
+	newAccessToken, nonce, privateKey, err := getAccessTokenForPrivateKey(a.httpClient, a.orgURL, clientAssertion, a.scopes, a.maxRetries, a.maxBackoff, a.clientId, a.privateKeySigner)
+	if err != nil {
+		return err
+	}
+
+	if newAccessToken == nil {
+		return errors.New("empty access token")
+	}
+
+	if err := setDpopHeaders(a.req, newAccessToken, privateKey, method, URL, nonce); err != nil {
+		return err
+	}
+
+	cacheNewToken(a.tokenCache, newAccessToken, nonce, privateKey)
 	return nil
 }
 
@@ -288,90 +299,46 @@ func NewJWTAuth(config JWTAuthConfig) *JWTAuth {
 }
 
 func (a *JWTAuth) Authorize(method, URL string) error {
-	accessToken, hasToken := a.tokenCache.Get(AccessTokenCacheKey)
-	if hasToken && accessToken != "" {
-		accessTokenWithTokenType := accessToken.(string)
-		a.req.Header.Add("Authorization", accessTokenWithTokenType)
-		nonce, hasNonce := a.tokenCache.Get(DpopAccessTokenNonce)
-		if hasNonce && nonce != "" {
-			privateKey, ok := a.tokenCache.Get(DpopAccessTokenPrivateKey)
-			if ok && privateKey != nil {
-				res := strings.Split(accessTokenWithTokenType, " ")
-				if len(res) != 2 {
-					return errors.New("unidentified access token")
-				}
-				dpopJWT, err := generateDpopJWT(privateKey.(*rsa.PrivateKey), method, URL, nonce.(string), res[1])
-				if err != nil {
-					return err
-				}
-				a.req.Header.Set("Dpop", dpopJWT)
-				a.req.Header.Set("x-okta-user-agent-extended", "isDPoP:true")
-			} else {
-				return errors.New("using Dpop but signing key not found")
-			}
-		}
-	} else {
-		// Use mutex to prevent concurrent token acquisition race conditions
-		// Only one goroutine should acquire a new token at a time
-		tokenAcquisitionMutex.Lock()
-
-		// Double-check if another goroutine already acquired the token while we waited
-		accessToken, hasToken = a.tokenCache.Get(AccessTokenCacheKey)
-		if hasToken && accessToken != "" {
-			tokenAcquisitionMutex.Unlock()
-			// Token was acquired by another goroutine, use it
-			accessTokenWithTokenType := accessToken.(string)
-			a.req.Header.Add("Authorization", accessTokenWithTokenType)
-			nonce, hasNonce := a.tokenCache.Get(DpopAccessTokenNonce)
-			if hasNonce && nonce != "" {
-				privateKey, ok := a.tokenCache.Get(DpopAccessTokenPrivateKey)
-				if ok && privateKey != nil {
-					res := strings.Split(accessTokenWithTokenType, " ")
-					if len(res) != 2 {
-						return errors.New("unidentified access token")
-					}
-					dpopJWT, err := generateDpopJWT(privateKey.(*rsa.PrivateKey), method, URL, nonce.(string), res[1])
-					if err != nil {
-						return err
-					}
-					a.req.Header.Set("Dpop", dpopJWT)
-					a.req.Header.Set("x-okta-user-agent-extended", "isDPoP:true")
-				} else {
-					return errors.New("using Dpop but signing key not found")
-				}
-			}
-			return nil
-		}
-
-		// We need to acquire a new token
-		defer tokenAcquisitionMutex.Unlock()
-
-		newAccessToken, nonce, privateKey, err := getAccessTokenForPrivateKey(a.httpClient, a.orgURL, a.clientAssertion, a.scopes, a.maxRetries, a.maxBackoff, "", nil)
-		if err != nil {
-			return err
-		}
-
-		if newAccessToken == nil {
-			return errors.New("empty access token")
-		}
-
-		a.req.Header.Set("Authorization", fmt.Sprintf("%v %v", newAccessToken.TokenType, newAccessToken.AccessToken))
-		if newAccessToken.TokenType == "DPoP" {
-			dpopJWT, err := generateDpopJWT(privateKey, method, URL, nonce, newAccessToken.AccessToken)
-			if err != nil {
-				return err
-			}
-			a.req.Header.Set("Dpop", dpopJWT)
-			a.req.Header.Set("x-okta-user-agent-extended", "isDPoP:true")
-		}
-
-		// Trim a couple of seconds off calculated expiry so cache expiry
-		// occures before Okta server side expiry.
-		expiration := newAccessToken.ExpiresIn - 2
-		a.tokenCache.Set(AccessTokenCacheKey, fmt.Sprintf("%v %v", newAccessToken.TokenType, newAccessToken.AccessToken), time.Second*time.Duration(expiration))
-		a.tokenCache.Set(DpopAccessTokenNonce, nonce, time.Second*time.Duration(expiration))
-		a.tokenCache.Set(DpopAccessTokenPrivateKey, privateKey, time.Second*time.Duration(expiration))
+	// Try to use cached token first
+	applied, err := applyTokenToRequest(a.req, a.tokenCache, method, URL)
+	if err != nil {
+		return err
 	}
+	if applied {
+		return nil
+	}
+
+	// No cached token - need to acquire one with mutex protection
+	tokenAcquisitionMutex.Lock()
+
+	// Double-check if another goroutine already acquired the token while we waited
+	applied, err = applyTokenToRequest(a.req, a.tokenCache, method, URL)
+	if err != nil {
+		tokenAcquisitionMutex.Unlock()
+		return err
+	}
+	if applied {
+		tokenAcquisitionMutex.Unlock()
+		return nil
+	}
+
+	// We need to acquire a new token
+	defer tokenAcquisitionMutex.Unlock()
+
+	newAccessToken, nonce, privateKey, err := getAccessTokenForPrivateKey(a.httpClient, a.orgURL, a.clientAssertion, a.scopes, a.maxRetries, a.maxBackoff, "", nil)
+	if err != nil {
+		return err
+	}
+
+	if newAccessToken == nil {
+		return errors.New("empty access token")
+	}
+
+	if err := setDpopHeaders(a.req, newAccessToken, privateKey, method, URL, nonce); err != nil {
+		return err
+	}
+
+	cacheNewToken(a.tokenCache, newAccessToken, nonce, privateKey)
 	return nil
 }
 
