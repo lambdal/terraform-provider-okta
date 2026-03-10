@@ -117,7 +117,11 @@ func FWProviderResources() []func() resource.Resource {
 		newAPITokenResource,
 		newAppTokenResource,
 		newAppConnectionsResource,
+		newAgentPoolUpdateResource,
 		newUISchemaResource,
+		newAppFederatedClaimResource,
+		newAppSignOnPolicyRulesResource,
+		newPushGroupResource,
 	}
 }
 
@@ -146,7 +150,12 @@ func FWProviderDataSources() []func() datasource.DataSource {
 		newAPITokenDataSource,
 		newAppTokenDataSource,
 		newAppConnectionsDataSource,
+		newAgentPoolDataSource,
 		newUISchemaDataSource,
+		newAppFederatedClaimDataSource,
+		newPushGroupDataSource,
+		newPushGroupsDataSource,
+		newAdminRoleCustomDataSource,
 	}
 }
 
@@ -226,7 +235,7 @@ func ProviderResources() map[string]*schema.Resource {
 		resources.OktaIDaaSPolicyRuleSignOn:              resourcePolicySignOnRule(),
 		resources.OktaIDaaSPolicySignOn:                  resourcePolicySignOn(),
 		resources.OktaIDaaSProfileMapping:                resourceProfileMapping(),
-		//resources.OktaIDaaSRateLimiting:                  resourceRateLimiting(),
+		// resources.OktaIDaaSRateLimiting:                  resourceRateLimiting(),
 		resources.OktaIDaaSResourceSet:                resourceResourceSet(),
 		resources.OktaIDaaSRoleSubscription:           resourceRoleSubscription(),
 		resources.OktaIDaaSSecurityNotificationEmails: resourceSecurityNotificationEmails(),
